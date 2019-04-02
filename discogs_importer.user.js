@@ -1,617 +1,1075 @@
-// ==UserScript==
+﻿// ==UserScript==
 
 // @name           Import Discogs releases to MusicBrainz
-// @version        2012-02-22_01
+// @description    Add a button to import Discogs releases to MusicBrainz and add links to matching MusicBrainz entities for various Discogs entities (artist,release,master,label)
+// @version        2018.7.14.1
 // @namespace      http://userscripts.org/users/22504
-// @icon           http://www.discogs.com/images/discogs130.png
-// @include        http://*musicbrainz.org/release/add
-// @include        http://*musicbrainz.org/release/*/add
-// @include        http://*musicbrainz.org/release/*/edit
-// @include        http://www.discogs.com/*
-// @include        http://*.discogs.com/*release/*
-// @exclude        http://*.discogs.com/*release/*?f=xml*
-// @exclude        http://www.discogs.com/release/add
-// @require        http://ajax.googleapis.com/ajax/libs/jquery/1.6.4/jquery.min.js
-// @require        https://raw.github.com/murdos/musicbrainz-userscripts/master/lib/import_functions.js
+// @downloadURL    https://raw.githubusercontent.com/murdos/musicbrainz-userscripts/master/discogs_importer.user.js
+// @updateURL      https://raw.githubusercontent.com/murdos/musicbrainz-userscripts/master/discogs_importer.user.js
+// @include        http*://www.discogs.com/*
+// @include        http*://*.discogs.com/*release/*
+// @exclude        http*://*.discogs.com/*release/*?f=xml*
+// @exclude        http*://www.discogs.com/release/add
+// @require        https://ajax.googleapis.com/ajax/libs/jquery/2.1.4/jquery.min.js
+// @require        lib/mbimport.js
+// @require        lib/logger.js
+// @require        lib/mblinks.js
+// @require        lib/mbimportstyle.js
+// @icon           https://raw.githubusercontent.com/murdos/musicbrainz-userscripts/master/assets/images/Musicbrainz_import_logo.png
 // ==/UserScript==
 
-// Script Update Checker
-// -- http://userscripts.org/scripts/show/20145
-var SUC_script_num = 36376;
-try{function updateCheck(forced){if ((forced) || (parseInt(GM_getValue('SUC_last_update', '0')) + 86400000 <= (new Date().getTime()))){try{GM_xmlhttpRequest({method: 'GET',url: 'http://userscripts.org/scripts/source/'+SUC_script_num+'.meta.js?'+new Date().getTime(),headers: {'Cache-Control': 'no-cache'},onload: function(resp){var local_version, remote_version, rt, script_name;rt=resp.responseText;GM_setValue('SUC_last_update', new Date().getTime()+'');remote_version=parseInt(/@uso:version\s*(.*?)\s*$/m.exec(rt)[1]);local_version=parseInt(GM_getValue('SUC_current_version', '-1'));if(local_version!=-1){script_name = (/@name\s*(.*?)\s*$/m.exec(rt))[1];GM_setValue('SUC_target_script_name', script_name);if (remote_version > local_version){if(confirm('There is an update available for the Greasemonkey script "'+script_name+'."\nWould you like to go to the install page now?')){GM_openInTab('http://userscripts.org/scripts/show/'+SUC_script_num);GM_setValue('SUC_current_version', remote_version);}}else if (forced)alert('No update is available for "'+script_name+'."');}else GM_setValue('SUC_current_version', remote_version+'');}});}catch (err){if (forced)alert('An error occurred while checking for updates:\n'+err);}}}GM_registerMenuCommand(GM_getValue('SUC_target_script_name', '???') + ' - Manual Update Check', function(){updateCheck(true);});updateCheck(false);}catch(err){}
+// prevent JQuery conflicts, see http://wiki.greasespot.net/@grant
+this.$ = this.jQuery = jQuery.noConflict(true);
+
+var DEBUG = false;
+//DEBUG = true;
+if (DEBUG) {
+    LOGGER.setLevel('debug');
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-if (!unsafeWindow) unsafeWindow = window;
+/*
+ * Test cases:
+ * - http://www.discogs.com/release/1566223 : Artist credit of tracks contains an ending ',' join phrase
+ */
 
-$(document).ready(function(){
+var mblinks = new MBLinks('DISCOGS_MBLINKS_CACHE', '1');
 
-	// On Musicbrainz website
-	if (window.location.href.match(/(musicbrainz\.org)/)) {
-	
-		$add_disc_dialog = $('div.add-disc-dialog');
-		//$add_disc_dialog.find('div.tabs ul.tabs').append('<li><a class="discogs" href="#discogs">Discogs import</a></li>');
+$(document).ready(function() {
+    MBImportStyle();
+    MBSearchItStyle();
 
-		var innerHTML = '<div class="add-disc-tab discogs" style="display: none">';
-		innerHTML += '<p>Use the following fields to search for a Discogs release.</p>';
-	    innerHTML += '<div class="pager" style="width: 100%; text-align: right; display: none;"><a href="#prev">&lt;&lt;</a><span class="pager"></span><a href="#next">&gt;&gt;</a></div>';
-		innerHTML += '<div style="display: none;" class="tracklist-searching import-message"><p><img src="/static/images/icons/loading.gif" />&nbsp;Searching...</p></div>';
-		innerHTML += '<div style="display: none;" class="tracklist-no-results import-message"><p>No results</p></div>';
-		innerHTML += '<div style="display: none;" class="tracklist-error import-message"><p>An error occured: <span class="message"> </span></p></div></div>';
-		//$add_disc_dialog.find('div.add-disc-tab:last').after(innerHTML);
+    let current_page_key = getDiscogsLinkKey(
+        window.location.href
+            .replace(/\?.*$/, '')
+            .replace(/#.*$/, '')
+            .replace('/master/view/', '/master/')
+    );
+    if (!current_page_key) return;
 
-	// On Discogs website
-	} else {
+    // disable evil pjax (used for artist page navigation)
+    // it causes various annoying issues with our code;
+    // it should be possible to react to pjax events
+    $('div#pjax_container').attr('id', 'pjax_disabled');
 
-        magnifyLinks();
+    // Display links of equivalent MusicBrainz entities
+    insertMBLinks(current_page_key);
 
-        // Release page?
-        if (window.location.href.match( /discogs\.com\/(.*\/?)release\/(\d+)$/) ) {
+    // Add an import button in a new section in sidebar, if we're on a release page
+    let current_page_info = link_infos[current_page_key];
+    if (current_page_info.type == 'release') {
+        // Discogs Webservice URL
+        let discogsWsUrl = `https://api.discogs.com/releases/${current_page_info.id}`;
 
-		    // Discogs Webservice URL           
-            var discogsReleaseId = window.location.href.match( /discogs\.com\/(.*\/?)release\/(\d+)$/)[2];
-            var discogsWsUrl = 'http://api.discogs.com/releases/' + discogsReleaseId;
-
-		    mylog(discogsWsUrl);
-
-            // Swith JQuery to MB's one, and save GreaseMonkey one
-            var GM_JQuery = $;
-            $ = unsafeWindow.$;
-            
-            $.ajax({
-              url: discogsWsUrl,
-              dataType: 'jsonp',
-              headers: { 'Accept-Encoding': 'gzip',  'User-Agent': 'MBDiscosgImporter/0.1 +http://userscripts.org/scripts/show/36376' },
-              crossDomain: true,
-              success: function (data, textStatus, jqXHR) {
-                //mylog(data);
-                var release = parseDiscogsRelease(data);
-                insertLink(release);
-              },
-              error: function(jqXHR, textStatus, errorThrown) {
-                mylog("AJAX Status:" + textStatus);
-                mylog("AJAX error thrown:" + errorThrown);
-              }
-            });
-            
-            // Back to GreaseMonkey's JQuery
-            $ = GM_JQuery;
-            
-        }
-        
-	}
+        $.ajax({
+            url: discogsWsUrl,
+            dataType: 'json',
+            crossDomain: true,
+            success: function(data, textStatus, jqXHR) {
+                LOGGER.debug('Discogs JSON Data from API:', data);
+                try {
+                    let release = parseDiscogsRelease(data);
+                    insertMBSection(release, current_page_key);
+                } catch (e) {
+                    $('div.musicbrainz').remove();
+                    let mbUI = $('<div class="section musicbrainz"><h3>MusicBrainz</h3></div>').hide();
+                    let mbContentBlock = $('<div class="section_content"></div>');
+                    mbUI.append(mbContentBlock);
+                    let mbError = $(
+                        `<p><small>${e}<br /><b>Please <a href="https://github.com/murdos/musicbrainz-userscripts/issues">report</a> this error, along the current page URL.</b></small></p>`
+                    );
+                    mbContentBlock.prepend(mbError);
+                    insertMbUI(mbUI);
+                    mbError.css({ 'background-color': '#fbb', 'margin-top': '4px', 'margin-bottom': '4px' });
+                    mbUI.slideDown();
+                    throw e;
+                }
+            },
+            error: function(jqXHR, textStatus, errorThrown) {
+                LOGGER.error('AJAX Status: ', textStatus);
+                LOGGER.error('AJAX error thrown: ', errorThrown);
+            }
+        });
+    }
 });
 
-function magnifyLinks() {
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//                              Display links of equivalent MusicBrainz entities                                      //
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // Check if we already added links for this content
-    if (document.body.hasAttribute('discogsLinksMagnified'))
-        return;
-    document.body.setAttribute('discogsLinksMagnified', true);
-
-    var re = /^http:\/\/www\.discogs\.com\/(.*)\/(master|release)\/(\d+)$/i;
-
-    var elems = document.body.getElementsByTagName('a');
-    for (var i = 0; i < elems.length; i++) {
-        var elem = elems[i];
-
-        // Ignore empty links
-        if (!elem.href || trim(elem.textContent) == '' || elem.textContent.substring(4,0) == 'http')
-            continue;
-			
-        //~ // Check if the link matches
-        if (m = re.exec(elem.href)) {
-            var type = m[2];
-            var id = m[3];
-            elem.href = "http://www.discogs.com/" + type + "/" + id;
-        }
-    }
-}
-
-// Remove whitespace in the beginning and end
-function trim(str) {
-    return str.replace(/^\s+/, '').replace(/\s+$/, '');
-}
-
-// Analyze Discogs data and return a release object
-function parseDiscogsRelease(data) {
-    
-    var discogsRelease = data.data;
-    
-    var release = new Object();
-	release.discs = [];
-
-	// Release artist credit
-    release.artist_credit = new Array();
-    $.each(discogsRelease.artists, function(index, artist) {
-        var ac = { 
-            'artist_name': artist.name.replace(/ \(\d+\)$/, ""), 
-            'credited_name': (artist.anv != "" ? artist.anv : artist.name.replace(/ \(\d+\)$/, "")), 
-            'joinphrase': decodeDiscogsJoinphrase(artist.join)
-        };
-        release.artist_credit.push(ac);
-    });
-    
-	// Release title
-	release.title = discogsRelease.title;
-
-    // Release date
-    if (discogsRelease.released) {
-        var releasedate = discogsRelease.released;
-        if (typeof releasedate != "undefined" && releasedate != "") {
-            var tmp = releasedate.split('-');        if (tmp[0] != "undefined" && tmp[0] != "") {
-                release.year = parseInt(tmp[0], 10);
-                if (tmp[1] != "undefined" && tmp[1] != "") {
-                    release.month = parseInt(tmp[1], 10);                
-                    if (tmp[2] != "undefined" && tmp[2] != "") {
-                        release.day = parseInt(tmp[2], 10);
-                    }
+// Insert MusicBrainz links in a section of the page
+function insertMBLinks(current_page_key) {
+    function searchAndDisplayMbLinkInSection($tr, discogs_type, mb_type, nosearch) {
+        if (!mb_type) mb_type = defaultMBtype(discogs_type);
+        $tr.find(`a[mlink^="${discogs_type}/"]`).each(function() {
+            let $link = $(this);
+            if ($link.attr('mlink_stop')) return; // for places
+            let mlink = $link.attr('mlink');
+            // ensure we do it only once per link
+            let done = ($link.attr('mlink_done') || '').split(',');
+            for (let i = 0; i < done.length; i++) {
+                if (mb_type == done[i]) return;
+            }
+            done.push(mb_type);
+            $link.attr(
+                'mlink_done',
+                done
+                    .filter(function(e) {
+                        return e != '';
+                    })
+                    .join(',')
+            );
+            if (link_infos[mlink] && link_infos[mlink].type == discogs_type) {
+                let discogs_url = link_infos[mlink].clean_url;
+                let cachekey = getCacheKeyFromInfo(mlink, mb_type);
+                let has_wrapper = $link.closest('span.mb_wrapper').length;
+                if (!has_wrapper) {
+                    $link.wrap('<span class="mb_wrapper"><span class="mb_valign"></span></span>');
                 }
+                if (!nosearch) {
+                    // add search link for the current link text
+                    let entities = {
+                        artist: { mark: 'A' },
+                        release: { mark: 'R' },
+                        'release-group': { mark: 'G' },
+                        place: { mark: 'P' },
+                        label: { mark: 'L' }
+                    };
+                    let mark = '';
+                    let entity_name = 'entity';
+                    if (mb_type in entities) {
+                        mark = entities[mb_type].mark;
+                        entity_name = mb_type.replace(/[_-]/g, ' ');
+                    }
+                    $link
+                        .closest('span.mb_wrapper')
+                        .prepend(
+                            `<span class="mb_valign mb_searchit"><a class="mb_search_link" target="_blank" title="Search this ${entity_name} on MusicBrainz (open in a new tab)" href="${MBImport.searchUrlFor(
+                                mb_type,
+                                $link.text()
+                            )}"><small>${mark}</small>?</a></span>`
+                        );
+                }
+                let insert_normal = function(link) {
+                    $link.closest('span.mb_valign').before(`<span class="mb_valign">${link}</span>`);
+                    $link
+                        .closest('span.mb_wrapper')
+                        .find('.mb_searchit')
+                        .remove();
+                };
+
+                let insert_stop = function(link) {
+                    insert_normal(link);
+                    $link.attr('mlink_stop', true);
+                };
+
+                let insert_func = insert_normal;
+                if (mb_type == 'place') {
+                    // if a place link was added we stop, we don't want further queries for this 'label'
+                    insert_func = insert_stop;
+                }
+                mblinks.searchAndDisplayMbLink(discogs_url, mb_type, insert_func, cachekey);
+            }
+        });
+    }
+
+    function debug_color(what, n, id) {
+        let colors = [
+            '#B3C6FF',
+            '#C6B3FF',
+            '#ECB3FF',
+            '#FFB3EC',
+            '#FFB3C6',
+            '#FFC6B3',
+            '#FFECB3',
+            '#ECFFB3',
+            '#C6FFB3',
+            '#B3FFC6',
+            '#B3FFEC',
+            '#B3ECFF',
+            '#7598FF'
+        ];
+        if (DEBUG) {
+            $(what).css('border', `2px dotted ${colors[n % colors.length]}`);
+            let debug_attr = $(what).attr('debug_discogs');
+            if (!id) id = '';
+            if (debug_attr) {
+                $(what).attr('debug_discogs', `${debug_attr} || ${id}(${n})`);
+            } else {
+                $(what).attr('debug_discogs', `${id}(${n})`);
             }
         }
     }
 
+    let add_mblinks_counter = 0;
+    function add_mblinks(_root, selector, types, nosearch) {
+        // types can be:
+        // 'discogs type 1'
+        // ['discogs_type 1', 'discogs_type 2']
+        // [['discogs_type 1', 'mb type 1'], 'discogs_type 2']
+        // etc.
+        if (!$.isArray(types)) {
+            // just one string
+            types = [types];
+        }
+        $.each(types, function(idx, val) {
+            if (!$.isArray(val)) {
+                types[idx] = [val, undefined];
+            }
+        });
+
+        LOGGER.debug(`add_mblinks: ${selector} / ${JSON.stringify(types)}`);
+
+        _root.find(selector).each(function() {
+            let node = $(this).get(0);
+            magnifyLinks(node);
+            debug_color(this, ++add_mblinks_counter, selector);
+            let that = this;
+            $.each(types, function(idx, val) {
+                let discogs_type = val[0];
+                let mb_type = val[1];
+                searchAndDisplayMbLinkInSection($(that), discogs_type, mb_type, nosearch);
+            });
+        });
+    }
+
+    // Find MB link for the current page and display it next to page title
+    let mbLinkInsert = function(link) {
+        let $h1 = $('h1');
+        let $titleSpan = $h1.children('span[itemprop="name"]');
+        if ($titleSpan.length > 0) {
+            $titleSpan.before(link);
+        } else {
+            $h1.prepend(link);
+        }
+    };
+    let current_page_info = link_infos[current_page_key];
+    let mb_type = defaultMBtype(current_page_info.type);
+    let cachekey = getCacheKeyFromInfo(current_page_key, mb_type);
+    mblinks.searchAndDisplayMbLink(current_page_info.clean_url, mb_type, mbLinkInsert, cachekey);
+
+    let $root = $('body');
+    add_mblinks($root, 'div.profile', ['artist', 'label']);
+    add_mblinks($root, 'tr[data-object-type="release"] td.artist,td.title', 'artist');
+    add_mblinks($root, 'tr[data-object-type="release"] td.title', 'release');
+    add_mblinks($root, 'tr[data-object-type="release"]', 'label');
+    add_mblinks($root, 'tr[data-object-type~="master"]', ['master', 'artist', 'label']);
+    add_mblinks($root, 'div#tracklist', 'artist');
+    add_mblinks($root, 'div#companies', [['label', 'place'], 'label']);
+    add_mblinks($root, 'div#credits', ['label', 'artist']);
+    add_mblinks($root, 'div#page_aside div.section_content:first', 'master', true);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//                                 Normalize Discogs URLs in a DOM tree                                               //
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+var mlink_processed = 0;
+
+// Normalize Discogs URLs in a DOM tree
+function magnifyLinks(rootNode) {
+    if (!rootNode) {
+        rootNode = document.body;
+    }
+
+    // Check if we already added links for this content
+    if (rootNode.hasAttribute('mlink_processed')) return;
+    rootNode.setAttribute('mlink_processed', ++mlink_processed);
+
+    let elems = rootNode.getElementsByTagName('a');
+    for (let i = 0; i < elems.length; i++) {
+        let elem = elems[i];
+
+        // Ignore empty links
+        if (!elem.href || $.trim(elem.textContent) == '' || elem.textContent.substring(4, 0) == 'http') continue;
+        if (!elem.hasAttribute('mlink')) {
+            elem.setAttribute('mlink', getDiscogsLinkKey(elem.href));
+        }
+    }
+}
+
+// contains infos for each link key
+var link_infos = {};
+
+// Parse discogs url to extract info, returns a key and set link_infos for this key
+// the key is in the form discogs_type/discogs_id
+function getDiscogsLinkKey(url) {
+    let re = /^https?:\/\/(?:www|api)\.discogs\.com\/(?:(?:(?!sell).+|sell.+)\/)?(master|release|artist|label)s?\/(\d+)(?:[^\?#]*)(?:\?noanv=1|\?anv=[^=]+)?$/i;
+    if ((m = re.exec(url))) {
+        let key = `${m[1]}/${m[2]}`;
+        if (!link_infos[key]) {
+            link_infos[key] = {
+                type: m[1],
+                id: m[2],
+                clean_url: `https://www.discogs.com/${m[1]}/${m[2]}`
+            };
+            LOGGER.debug(`getDiscogsLinkKey:${url} --> ${key}`);
+        } else {
+            LOGGER.debug(`getDiscogsLinkKey:${url} --> ${key} (key exists)`);
+        }
+        return key;
+    }
+    LOGGER.debug(`getDiscogsLinkKey:${url} ?`);
+    return false;
+}
+
+function getCleanUrl(url, discogs_type) {
+    try {
+        let key = getDiscogsLinkKey(url);
+        if (key) {
+            if (!discogs_type || link_infos[key].type == discogs_type) {
+                LOGGER.debug(`getCleanUrl: ${key}, ${url} --> ${link_infos[key].clean_url}`);
+                return link_infos[key].clean_url;
+            } else {
+                LOGGER.debug(`getCleanUrl: ${key}, ${url} --> unmatched type: ${discogs_type}`);
+            }
+        }
+    } catch (err) {
+        LOGGER.error(err);
+    }
+    LOGGER.debug(`getCleanUrl: ${url} (${discogs_type}) failed`);
+    return false;
+}
+
+function defaultMBtype(discogs_type) {
+    if (discogs_type == 'master') return 'release-group';
+    return discogs_type;
+}
+
+function getCacheKeyFromInfo(info_key, mb_type) {
+    let inf = link_infos[info_key];
+    if (inf) {
+        if (!mb_type) mb_type = defaultMBtype(inf.type);
+        return `${inf.type}/${inf.id}/${mb_type}`;
+    }
+    return '';
+}
+
+function getCacheKeyFromUrl(url, discogs_type, mb_type) {
+    try {
+        let key = getDiscogsLinkKey(url);
+        if (key) {
+            if (!discogs_type || link_infos[key].type == discogs_type) {
+                let cachekey = getCacheKeyFromInfo(key, mb_type);
+                LOGGER.debug(`getCacheKeyFromUrl: ${key}, ${url} --> ${cachekey}`);
+                return cachekey;
+            } else {
+                LOGGER.debug(`getCacheKeyFromUrl: ${key}, ${url} --> unmatched type: ${discogs_type}`);
+            }
+        }
+    } catch (err) {
+        LOGGER.error(err);
+    }
+    LOGGER.debug(`getCacheKeyFromUrl: ${url} (${discogs_type}) failed`);
+    return false;
+}
+
+function MBIDfromUrl(url, discogs_type, mb_type) {
+    let cachekey = getCacheKeyFromUrl(url, discogs_type, mb_type);
+    if (!cachekey) return '';
+    return mblinks.resolveMBID(cachekey);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//                             Insert MusicBrainz section into Discogs page                                           //
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+function insertMbUI(mbUI) {
+    let e;
+    if ((e = $('div.section.collections')) && e.length) {
+        e.after(mbUI);
+    } else if ((e = $('#statistics')) && e.length) {
+        e.before(mbUI);
+    } else if ((e = $('div.section.social')) && e.length) {
+        e.before(mbUI);
+    }
+}
+
+// Insert links in Discogs page
+function insertMBSection(release, current_page_key) {
+    let current_page_info = link_infos[current_page_key];
+
+    let mbUI = $('<div class="section musicbrainz"><h3>MusicBrainz</h3></div>').hide();
+
+    if (DEBUG) mbUI.css({ border: '1px dotted red' });
+
+    let mbContentBlock = $('<div class="section_content"></div>');
+    mbUI.append(mbContentBlock);
+
+    if (release.maybe_buggy) {
+        let warning_buggy = $(
+            '<p><small><b>Warning</b>: this release has perhaps a buggy tracklist, please check twice the data you import.</small><p'
+        ).css({ color: 'red', 'margin-top': '4px', 'margin-bottom': '4px' });
+        mbContentBlock.prepend(warning_buggy);
+    }
+
+    // Form parameters
+    let edit_note = MBImport.makeEditNote(current_page_info.clean_url, 'Discogs');
+    let parameters = MBImport.buildFormParameters(release, edit_note);
+
+    // Build form + search button
+    let innerHTML = `<div id="mb_buttons">${MBImport.buildFormHTML(parameters)}${MBImport.buildSearchButton(release)}</div>`;
+    mbContentBlock.append(innerHTML);
+
+    insertMbUI(mbUI);
+
+    $('#mb_buttons').css({
+        display: 'inline-block',
+        width: '100%'
+    });
+    $('form.musicbrainz_import').css({ width: '49%', display: 'inline-block' });
+    $('form.musicbrainz_import_search').css({ float: 'right' });
+    $('form.musicbrainz_import > button').css({ width: '100%', 'box-sizing': 'border-box' });
+
+    mbUI.slideDown();
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//                                               Parsing of Discogs data                                              //
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+function cleanup_discogs_artist_credit(obj) {
+    // Fix some odd Discogs release (e.g. http://api.discogs.com/releases/1566223) that have a ',' join phrase after the last artist
+    // Discogs set a join phrase even there's only one artist or when extraartists is set (ie. remix)
+    let last = obj.artist_credit.length - 1;
+    if (last == 0 || obj.artist_credit[last].joinphrase == ', ') {
+        obj.artist_credit[last].joinphrase = '';
+    }
+}
+
+// Returns the name without the numerical suffic Discogs adds as disambiguation
+// ie. "ABC (123)" -> "ABC"
+function artistNoNum(artist_name) {
+    return artist_name.replace(/ \(\d+\)$/, '');
+}
+
+// Parse a US date string and set object properties year, month, day
+function parse_YYYY_MM_DD(date, obj) {
+    if (!date) return;
+    let m = date.split(/\D+/, 3).map(function(e) {
+        return parseInt(e, 10);
+    });
+    if (m[0] !== undefined) {
+        obj.year = m[0];
+        if (m[1] !== undefined) {
+            obj.month = m[1];
+            if (m[2] !== undefined) {
+                obj.day = m[2];
+            }
+        }
+    }
+}
+
+// Analyze Discogs data and return a release object
+function parseDiscogsRelease(data) {
+    let discogsRelease = data;
+
+    let release = {};
+    release.discs = [];
+
+    //buggy tracklist indicator, used to warn user
+    release.maybe_buggy = false;
+
+    // Release artist credit
+    release.artist_credit = [];
+    $.each(discogsRelease.artists, function(index, artist) {
+        let ac = {
+            artist_name: artistNoNum(artist.name),
+            credited_name: artist.anv != '' ? artist.anv : artistNoNum(artist.name),
+            joinphrase: decodeDiscogsJoinphrase(artist.join),
+            mbid: MBIDfromUrl(artist.resource_url, 'artist')
+        };
+        if (artist.id == 194) {
+            // discogs place holder for various
+            ac = MBImport.specialArtist('various_artists', ac);
+        }
+        release.artist_credit.push(ac);
+    });
+    cleanup_discogs_artist_credit(release);
+
+    // ReleaseGroup
+    if (discogsRelease.master_url) {
+        release.release_group_mbid = MBIDfromUrl(discogsRelease.master_url, 'master');
+    }
+
+    // Release title
+    release.title = discogsRelease.title;
+
+    // Release date
+    if (discogsRelease.released) {
+        parse_YYYY_MM_DD(discogsRelease.released, release);
+    }
+
     // Release country
     if (discogsRelease.country) {
-        release.country = Countries[ discogsRelease.country ];
+        release.country = Countries[discogsRelease.country];
     }
 
     // Release labels
-    release.labels = new Array();
+    release.labels = [];
     if (discogsRelease.labels) {
         $.each(discogsRelease.labels, function(index, label) {
-            release.labels.push( { name: label.name, catno: (label.catno == "none" ? "[none]" : label.catno) } );
-        });   
+            let labelinfo = {
+                name: label.name,
+                catno: label.catno == 'none' ? '[none]' : label.catno,
+                mbid: MBIDfromUrl(label.resource_url, 'label')
+            };
+            release.labels.push(labelinfo);
+        });
     }
-    
+
+    // Release URL
+    release.urls = [{ url: getCleanUrl(discogsRelease.uri, 'release'), link_type: MBImport.URL_TYPES.discogs }];
+
     // Release format
-    var release_format;
+    let release_formats = [];
+    release.secondary_types = [];
 
     if (discogsRelease.formats.length > 0) {
-        release_format = MediaTypes[ discogsRelease.formats[0].name ];
-        
-        if (discogsRelease.formats[0].descriptions) {
-            $.each(discogsRelease.formats[0].descriptions, function(index, desc) {
-                // Release format: special handling of vinyl 7", 10" and 12"
-                if (desc.match(/7"|10"|12"/)) release_format = MediaTypes[desc];
-                // Release format: special handling of Vinyl, LP == 12" (http://www.discogs.com/help/submission-guidelines-release-format.html#LP)
-                if (discogsRelease.formats[0].name == "Vinyl" && desc == "LP") release_format = '12" Vinyl';
-                // Release status
-                if (desc.match(/Promo|Smplr/)) release.status = "promotion";
-                // Release type
-                if (desc.match(/Compilation/)) release.type = "compilation";
-                if (desc.match(/Single/)) release.type = "single";
+        for (let i = 0; i < discogsRelease.formats.length; i++) {
+            // Release format
+            var discogs_format = discogsRelease.formats[i].name;
+            var mb_format = undefined;
+            if (discogs_format in MediaTypes) {
+                mb_format = MediaTypes[discogs_format];
+            }
 
-            });
+            if (discogsRelease.formats[i].descriptions) {
+                $.each(discogsRelease.formats[i].descriptions, function(index, desc) {
+                    if (!(discogs_format in ['Box Set'])) {
+                        // Release format: special handling of Vinyl and Shellac 7", 10" and 12"
+                        if (desc.match(/7"|10"|12"/) && discogs_format.concat(desc) in MediaTypes)
+                            mb_format = MediaTypes[discogs_format.concat(desc)];
+                        // Release format: special handling of specific CD/DVD formats
+                        if (desc.match(/^VCD|SVCD|CD\+G|HDCD|DVD-Audio|DVD-Video/) && desc in MediaTypes) mb_format = MediaTypes[desc];
+                    }
+                    // Release format: special handling of Vinyl, LP == 12" (http://www.discogs.com/help/submission-guidelines-release-format.html#LP)
+                    if (discogs_format == 'Vinyl' && desc == 'LP') mb_format = '12" Vinyl';
+                    // Release format: special handling of CD, Mini == 8cm CD
+                    if (discogs_format == 'CD' && desc == 'Mini') mb_format = '8cm CD';
+                    // Release status
+                    if (desc.match(/Promo|Smplr/)) release.status = 'promotion';
+                    if (desc.match(/Unofficial Release/)) release.status = 'bootleg';
+                    // Release type
+                    if (desc.match(/Compilation/)) release.secondary_types.push('compilation');
+                    if (desc.match(/^Album/)) release.type = 'album';
+                    if (desc.match(/Single(?! Sided)/)) release.type = 'single';
+                    if (desc.match(/EP|Mini-Album/)) release.type = 'ep';
+                });
+            }
+
+            if (mb_format) {
+                for (let j = 0; j < discogsRelease.formats[i].qty; j++) {
+                    release_formats.push(mb_format);
+                }
+            }
+
+            // Release packaging
+            if (discogsRelease.formats[i].text) {
+                let freetext = discogsRelease.formats[i].text.toLowerCase().replace(/[\s-]/g, '');
+                if (freetext.match(/cardboard|paper/)) release.packaging = 'cardboard/paper sleeve';
+                else if (freetext.match(/digipak/)) release.packaging = 'digipak';
+                else if (freetext.match(/keepcase/)) release.packaging = 'keep case';
+                else if (freetext.match(/jewel/)) {
+                    release.packaging = freetext.match(/slim/) ? 'slim jewel case' : 'jewel case';
+                } else if (freetext.match(/gatefold|digisleeve/)) release.packaging = 'gatefold cover';
+            }
         }
-        
-        // Release packaging
-        if (discogsRelease.formats[0].text && discogsRelease.formats[0].text.match(/Cardboard/)) release.packaging = "paper sleeve";
-        if (discogsRelease.formats[0].text && discogsRelease.formats[0].text.match(/Digipak/)) release.packaging = "digipak";
-        if (discogsRelease.formats[0].text && discogsRelease.formats[0].text.match(/Jewel/)) release.packaging = "jewel";
     }
 
     // Barcode
     if (discogsRelease.identifiers) {
         $.each(discogsRelease.identifiers, function(index, identifier) {
-            if (identifier.type == "Barcode") {
+            if (identifier.type == 'Barcode') {
                 release.barcode = identifier.value.replace(/ /g, '');
                 return false;
             }
         });
     }
-    
-	// Inspect tracks
-	var tracks = [];
 
-	$.each(discogsRelease.tracklist, function(index, discogsTrack) {
-		// TODO: dectect disc title and set disc.title
+    // Inspect tracks
+    let tracks = [];
 
-		var track = new Object();
-		
-		track.title = discogsTrack.title;
-		track.duration = discogsTrack.duration;
-		
-		// Track artist credit
-		track.artist_credit = new Array();
+    let heading = '';
+    let releaseNumber = 1;
+    let lastPosition = 0;
+    $.each(discogsRelease.tracklist, function(index, discogsTrack) {
+        if (discogsTrack.type_ == 'heading') {
+            heading = discogsTrack.title;
+            return;
+        }
+        if (discogsTrack.type_ != 'track' && discogsTrack.type_ != 'index') {
+            return;
+        }
+
+        let track = new Object();
+
+        track.title = discogsTrack.title.replace(/´/g, '’');
+        track.duration = MBImport.hmsToMilliSeconds(discogsTrack.duration); // MB in milliseconds
+
+        // Track artist credit
+        track.artist_credit = [];
         if (discogsTrack.artists) {
             $.each(discogsTrack.artists, function(index, artist) {
-                var ac = { 
-                    'artist_name': artist.name.replace(/ \(\d+\)$/, ""), 
-                    'credited_name': (artist.anv != "" ? artist.anv : artist.name.replace(/ \(\d+\)$/, "")), 
-                    'joinphrase': decodeDiscogsJoinphrase(artist.join)
+                let ac = {
+                    artist_name: artistNoNum(artist.name),
+                    credited_name: artist.anv != '' ? artist.anv : artistNoNum(artist.name),
+                    joinphrase: decodeDiscogsJoinphrase(artist.join),
+                    mbid: MBIDfromUrl(artist.resource_url, 'artist')
                 };
                 track.artist_credit.push(ac);
             });
-        }
-		
-		// Track position and release number
-		var trackPosition = discogsTrack.position;
-		var releaseNumber = 1;
-
-        // Skip special tracks
-        if (trackPosition.toLowerCase().match("^(video|mp3)")) { 
-            trackPosition = "";
+            cleanup_discogs_artist_credit(track);
         }
 
-	    // Remove "CD" prefix
-    	trackPosition = trackPosition.replace(/^CD/i, "");
+        // Track position and release number
+        let trackPosition = discogsTrack.position;
 
-        // Multi discs e.g. 1.1 or 1-1
-		var tmp = trackPosition.match(/^(\d+)(?=(-|\.)\d*)/);
-
-		if (tmp && tmp[0]) {
-			releaseNumber = tmp[0];
-		} else {
-        // Vinyls disc numbering: A1, B3, ...
-            tmp = trackPosition.match(/^([A-Za-z])\d*/);
-            if (tmp && tmp[0] && tmp[0] != "V") { 
-                var code = tmp[0].charCodeAt(0);
-                // A-Z 
-                if (65 <= code && code <= 90) {
-                    code = code - 65;
-                } else if (97 <= code && code <= 122) {
-                // a-z
-                    code = code - (65 + 32);
+        // Handle sub-tracks
+        if (trackPosition == '' && discogsTrack.sub_tracks) {
+            trackPosition = discogsTrack.sub_tracks[0].position;
+            // Append titles of sub-tracks to main track title
+            let subtrack_titles = [];
+            let subtrack_total_duration = 0;
+            $.each(discogsTrack.sub_tracks, function(subtrack_index, subtrack) {
+                if (subtrack.type_ != 'track') {
+                    return;
                 }
-                releaseNumber = (code-code%2)/2+1; 
+                if (subtrack.duration) {
+                    subtrack_total_duration += MBImport.hmsToMilliSeconds(subtrack.duration);
+                }
+                if (subtrack.title) {
+                    subtrack_titles.push(subtrack.title);
+                } else {
+                    subtrack_titles.push('[unknown]');
+                }
+            });
+            if (subtrack_titles.length) {
+                if (track.title) {
+                    track.title += ': ';
+                }
+                track.title += subtrack_titles.join(' / ');
+            }
+            if (isNaN(track.duration) && !isNaN(subtrack_total_duration)) {
+                track.duration = subtrack_total_duration;
             }
         }
 
-		// Create release if needed
-		if ( !release.discs[releaseNumber-1] ) {
-			release.discs.push(new Object());
-			release.discs[releaseNumber-1].tracks = [];
-            release.discs[releaseNumber-1].format = release_format;
-		}
+        // Skip special tracks
+        if (trackPosition.match(/^(?:video|mp3)/i)) {
+            trackPosition = '';
+        }
 
-		// Trackposition is empty e.g. for release title
-		if (trackPosition != "" && trackPosition != null)
-			release.discs[releaseNumber-1].tracks.push(track);
-		
-	});
+        // Possible track position:
+        // A1 or A    => Vinyl or Cassette : guess releaseNumber from vinyl side
+        // 1-1 or 1.1 => releaseNumber.trackNumber
+        // 1          => trackNumber
+        let tmp = trackPosition.match(/(\d+|[A-Z])(?:[\.-]+(\d+))?/i);
+        if (tmp) {
+            tmp[1] = parseInt(tmp[1], 10);
+            var buggyTrackNumber = false;
+            let prevReleaseNumber = releaseNumber;
 
-    mylog(release);
-	return release;
-}
+            if (Number.isInteger(tmp[1])) {
+                if (tmp[2]) {
+                    // 1-1, 1-2, 2-1, ... - we can get release number and track number from this
+                    releaseNumber = tmp[1];
+                    lastPosition = parseInt(tmp[2], 10);
+                } else if (tmp[1] <= lastPosition) {
+                    // 1, 2, 3, ... - We've moved onto a new medium
+                    releaseNumber++;
+                    lastPosition = tmp[1];
+                } else {
+                    lastPosition = tmp[1];
+                }
+            } else {
+                if (trackPosition.match(/^[A-Z]\d*$/i)) {
+                    // Vinyl or cassette, handle it specially
+                    // A,B -> 1; C,D -> 2; E,F -> 3, etc...
+                    releaseNumber = (((32 | trackPosition.charCodeAt(0)) - 97) >> 1) + 1;
+                    lastPosition++;
+                } else if (trackPosition.match(/^[A-Z]+\d*$/i)) {
+                    // Vinyl or cassette, handle it specially
+                    // something like AA1, exemple : http://www.discogs.com/release/73531
+                    // TODO: find a better fix
+                    buggyTrackNumber = true;
+                }
+            }
 
-// Insert links in Discogs page
-function insertLink(release) {
+            if (releaseNumber > release_formats.length) {
+                // something went wrong in track position parsing
+                buggyTrackNumber = true;
+                releaseNumber = prevReleaseNumber;
+            }
+            if (buggyTrackNumber) {
+                // well, it went wrong so ...
+                lastPosition++;
+            }
+        }
 
-	var mbUI = document.createElement('div');
-    mbUI.innerHTML = "<h3>MusicBrainz</h3>";    
-	mbUI.className = "section";
+        // Create release if needed
+        let discindex = releaseNumber - 1;
+        if (!release.discs[discindex]) {
+            let newdisc = {
+                tracks: [],
+                format: release_formats[discindex]
+            };
+            if (heading) {
+                newdisc.title = heading;
+                heading = '';
+            }
+            release.discs.push(newdisc);
+        }
 
-	var mbContentBlock = document.createElement('div');
-    mbContentBlock.className = "section_content";
-    mbUI.appendChild(mbContentBlock);
+        // Track number (only for Vinyl and Cassette)
+        if (
+            buggyTrackNumber ||
+            (release.discs[discindex].format.match(/(Vinyl|Cassette)/) && discogsTrack.position.match(/^[A-Z]+[\.-]?\d*/i))
+        ) {
+            track.number = discogsTrack.position;
+        }
 
-	// Form parameters
-    var edit_note = 'Imported from ' + window.location.href.replace(/http:\/\/(www\.|)discogs\.com\/(.*\/|)release\//, 'http://discogs.com/release/');
-	var parameters = MBReleaseImportHelper.buildFormParameters(release, edit_note);
+        // Trackposition is empty e.g. for release title
+        if (trackPosition != '' && trackPosition != null) {
+            release.discs[discindex].tracks.push(track);
+        }
 
-	// Build form
-	var innerHTML = MBReleaseImportHelper.buildFormHTML(parameters);
-    // Append search link
-	innerHTML += ' <small>(' + MBReleaseImportHelper.buildSearchLink(release) + ')</small>';
+        if (buggyTrackNumber && !release.maybe_buggy) {
+            release.maybe_buggy = true;
+        }
+    });
 
-	mbContentBlock.innerHTML = innerHTML;
-	var prevNode = document.body.querySelector("div.section.ratings");
-	prevNode.parentNode.insertBefore(mbUI, prevNode);
+    if (release.discs.length == 1 && release.discs[0].title) {
+        // remove title if there is only one disc
+        // https://github.com/murdos/musicbrainz-userscripts/issues/69
+        release.discs[0].title = '';
+    }
+
+    LOGGER.info('Parsed release: ', release);
+    return release;
 }
 
 function decodeDiscogsJoinphrase(join) {
-    var joinphrase = "";
-    var trimedjoin = join.replace(/^\s*/, "").replace(/\s*$/, "");
-    if (trimedjoin == "") return trimedjoin;
-    if (trimedjoin != ",") joinphrase += " ";
+    let joinphrase = '';
+    let trimedjoin = join.replace(/^\s*/, '').replace(/\s*$/, '');
+    if (trimedjoin == '') return trimedjoin;
+    if (trimedjoin != ',') joinphrase += ' ';
     joinphrase += trimedjoin;
-    joinphrase += " ";
+    joinphrase += ' ';
     return joinphrase;
-} 
-
-function mylog(obj) {
-    var DEBUG = true;
-    if (DEBUG && unsafeWindow.console) {
-        unsafeWindow.console.log(obj);
-    }
 }
 
-// Reference Discogs <-> MusicBrainz map
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//                                   Discogs -> MusicBrainz mapping                                                   //
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-var MediaTypes = new Array();
-MediaTypes["8-Track Cartridge"] = "Cartridge";
-MediaTypes["Acetate"] = "Vinyl";
-MediaTypes["Betamax"] = "Betamax";
-MediaTypes["Blu-ray"] = "Blu-ray";
-MediaTypes["Blu-ray-R"] = "Blu-ray";
-MediaTypes["Cassette"] = "Cassette";
-MediaTypes["CD"] = "CD";
-MediaTypes["CDr"] = "CD-R";
-MediaTypes["CDV"] = "CD";
-MediaTypes["Cylinder"] = "Wax Cylinder";
-MediaTypes["DAT"] = "DAT";
-MediaTypes["Datassette"] = "Other";
-MediaTypes["DCC"] = "DCC";
-MediaTypes["DVD"] = "DVD";
-MediaTypes["DVDr"] = "DVD";
-MediaTypes["Edison Disc"] = "Vinyl";
-MediaTypes["File"] = "Digital Media";
-MediaTypes["Flexi-disc"] = "Vinyl";
-MediaTypes["Floppy Disk"] = 12;
-MediaTypes["HD DVD"] = "HD-DVD";
-MediaTypes["HD DVD-R"] = "HD-DVD";
-MediaTypes["Hybrid"] = "Other";
-MediaTypes["Laserdisc"] = "LaserDisc";
-MediaTypes["Memory Stick"] = "Digital Media";
-MediaTypes["Microcassette"] = "Other";
-MediaTypes["Minidisc"] = "MiniDisc";
-MediaTypes["MVD"] = "Other";
-MediaTypes["Reel-To-Reel"] = "Reel-to-reel";
-MediaTypes["SelectaVision"] = "Other";
-MediaTypes["Shellac"] = "Vinyl";
-MediaTypes["UMD"] = "UMD";
-MediaTypes["VHS"] = "VHS";
-MediaTypes["Video 2000"] = "Other";
-MediaTypes["Vinyl"] = "Vinyl";
-MediaTypes['7"'] = '7" Vinyl';
-MediaTypes['10"'] = '10" Vinyl';
-MediaTypes['12"'] = '12" Vinyl';
+var MediaTypes = {
+    '8-Track Cartridge': 'Cartridge',
+    Acetate: 'Vinyl',
+    Betamax: 'Betamax',
+    'Blu-ray': 'Blu-ray',
+    'Blu-ray-R': 'Blu-ray',
+    Cassette: 'Cassette',
+    CD: 'CD',
+    CDr: 'CD-R',
+    CDV: 'CDV',
+    'CD+G': 'CD+G',
+    Cylinder: 'Wax Cylinder',
+    DAT: 'DAT',
+    Datassette: 'Other',
+    DCC: 'DCC',
+    DVD: 'DVD',
+    DVDr: 'DVD',
+    'DVD-Audio': 'DVD-Audio',
+    'DVD-Video': 'DVD-Video',
+    'Edison Disc': 'Vinyl',
+    File: 'Digital Media',
+    'Flexi-disc': 'Vinyl',
+    'Floppy Disk': 'Other',
+    HDCD: 'HDCD',
+    'HD DVD': 'HD-DVD',
+    'HD DVD-R': 'HD-DVD',
+    Hybrid: 'Other',
+    Laserdisc: 'LaserDisc',
+    'Memory Stick': 'Other',
+    Microcassette: 'Other',
+    Minidisc: 'MiniDisc',
+    MVD: 'Other',
+    'Reel-To-Reel': 'Reel-to-reel',
+    SACD: 'SACD',
+    SelectaVision: 'Other',
+    Shellac: 'Shellac',
+    'Shellac7"': '7" Shellac',
+    'Shellac10"': '10" Shellac',
+    'Shellac12"': '12" Shellac',
+    SVCD: 'SVCD',
+    UMD: 'UMD',
+    VCD: 'VCD',
+    VHS: 'VHS',
+    'Video 2000': 'Other',
+    Vinyl: 'Vinyl',
+    'Vinyl7"': '7" Vinyl',
+    'Vinyl10"': '10" Vinyl',
+    'Vinyl12"': '12" Vinyl',
+    'Lathe Cut': 'Phonograph record'
+};
 
-var Countries = new Array();
-Countries["Afghanistan"] = "AF";
-Countries["Albania"] = "AL";
-Countries["Algeria"] = "DZ";
-Countries["American Samoa"] = "AS";
-Countries["Andorra"] = "AD";
-Countries["Angola"] = "AO";
-Countries["Anguilla"] = "AI";
-Countries["Antarctica"] = "AQ";
-Countries["Antigua and Barbuda"] = "AG";
-Countries["Argentina"] = "AR";
-Countries["Armenia"] = "AM";
-Countries["Aruba"] = "AW";
-Countries["Australia"] = "AU";
-Countries["Austria"] = "AT";
-Countries["Azerbaijan"] = "AZ";
-Countries["Bahamas"] = "BS";
-Countries["Bahrain"] = "BH";
-Countries["Bangladesh"] = "BD";
-Countries["Barbados"] = "BB";
-Countries["Belarus"] = "BY";
-Countries["Belgium"] = "BE";
-Countries["Belize"] = "BZ";
-Countries["Benin"] = "BJ";
-Countries["Bermuda"] = "BM";
-Countries["Bhutan"] = "BT";
-Countries["Bolivia"] = "BO";
-Countries["Croatia"] = "HR";
-Countries["Botswana"] = "BW";
-Countries["Bouvet Island"] = "BV";
-Countries["Brazil"] = "BR";
-Countries["British Indian Ocean Territory"] = "IO";
-Countries["Brunei Darussalam"] = "BN";
-Countries["Bulgaria"] = "BG";
-Countries["Burkina Faso"] = "BF";
-Countries["Burundi"] = "BI";
-Countries["Cambodia"] = "KH";
-Countries["Cameroon"] = "CM";
-Countries["Canada"] = "CA";
-Countries["Cape Verde"] = "CV";
-Countries["Cayman Islands"] = "KY";
-Countries["Central African Republic"] = "CF";
-Countries["Chad"] = "TD";
-Countries["Chile"] = "CL";
-Countries["China"] = "CN";
-Countries["Christmas Island"] = "CX";
-Countries["Cocos (Keeling) Islands"] = "CC";
-Countries["Colombia"] = "CO";
-Countries["Comoros"] = "KM";
-Countries["Congo"] = "CG";
-Countries["Cook Islands"] = "CK";
-Countries["Costa Rica"] = "CR";
-Countries["Virgin Islands, British"] = "VG";
-Countries["Cuba"] = "CU";
-Countries["Cyprus"] = "CY";
-Countries["Czech Republic"] = "CZ";
-Countries["Denmark"] = "DK";
-Countries["Djibouti"] = "DJ";
-Countries["Dominica"] = "DM";
-Countries["Dominican Republic"] = "DO";
-Countries["Ecuador"] = "EC";
-Countries["Egypt"] = "EG";
-Countries["El Salvador"] = "SV";
-Countries["Equatorial Guinea"] = "GQ";
-Countries["Eritrea"] = "ER";
-Countries["Estonia"] = "EE";
-Countries["Ethiopia"] = "ET";
-Countries["Falkland Islands (Malvinas)"] = "FK";
-Countries["Faroe Islands"] = "FO";
-Countries["Fiji"] = "FJ";
-Countries["Finland"] = "FI";
-Countries["France"] = "FR";
-Countries["French Guiana"] = "GF";
-Countries["French Polynesia"] = "PF";
-Countries["French Southern Territories"] = "TF";
-Countries["Gabon"] = "GA";
-Countries["Gambia"] = "GM";
-Countries["Georgia"] = "GE";
-Countries["Germany"] = "DE";
-Countries["Ghana"] = "GH";
-Countries["Gibraltar"] = "GI";
-Countries["Greece"] = "GR";
-Countries["Greenland"] = "GL";
-Countries["Grenada"] = "GD";
-Countries["Guadeloupe"] = "GP";
-Countries["Guam"] = "GU";
-Countries["Guatemala"] = "GT";
-Countries["Guinea"] = "GN";
-Countries["Guinea-Bissau"] = "GW";
-Countries["Guyana"] = "GY";
-Countries["Haiti"] = "HT";
-Countries["Virgin Islands, U.S."] = "VI";
-Countries["Honduras"] = "HN";
-Countries["Hong Kong"] = "HK";
-Countries["Hungary"] = "HU";
-Countries["Iceland"] = "IS";
-Countries["India"] = "IN";
-Countries["Indonesia"] = "ID";
-Countries["Wallis and Futuna"] = "WF";
-Countries["Iraq"] = "IQ";
-Countries["Ireland"] = "IE";
-Countries["Israel"] = "IL";
-Countries["Italy"] = "IT";
-Countries["Jamaica"] = "JM";
-Countries["Japan"] = "JP";
-Countries["Jordan"] = "JO";
-Countries["Kazakhstan"] = "KZ";
-Countries["Kenya"] = "KE";
-Countries["Kiribati"] = "KI";
-Countries["Kuwait"] = "KW";
-Countries["Kyrgyzstan"] = "KG";
-Countries["Lao People's Democratic Republic"] = "LA";
-Countries["Latvia"] = "LV";
-Countries["Lebanon"] = "LB";
-Countries["Lesotho"] = "LS";
-Countries["Liberia"] = "LR";
-Countries["Libyan Arab Jamahiriya"] = "LY";
-Countries["Liechtenstein"] = "LI";
-Countries["Lithuania"] = "LT";
-Countries["Luxembourg"] = "LU";
-Countries["Montserrat"] = "MS";
-Countries["Macedonia, The Former Yugoslav Republic of"] = "MK";
-Countries["Madagascar"] = "MG";
-Countries["Malawi"] = "MW";
-Countries["Malaysia"] = "MY";
-Countries["Maldives"] = "MV";
-Countries["Mali"] = "ML";
-Countries["Malta"] = "MT";
-Countries["Marshall Islands"] = "MH";
-Countries["Martinique"] = "MQ";
-Countries["Mauritania"] = "MR";
-Countries["Mauritius"] = "MU";
-Countries["Mayotte"] = "YT";
-Countries["Mexico"] = "MX";
-Countries["Micronesia, Federated States of"] = "FM";
-Countries["Morocco"] = "MA";
-Countries["Monaco"] = "MC";
-Countries["Mongolia"] = "MN";
-Countries["Mozambique"] = "MZ";
-Countries["Myanmar"] = "MM";
-Countries["Namibia"] = "NA";
-Countries["Nauru"] = "NR";
-Countries["Nepal"] = "NP";
-Countries["Netherlands"] = "NL";
-Countries["Netherlands Antilles"] = "AN";
-Countries["New Caledonia"] = "NC";
-Countries["New Zealand"] = "NZ";
-Countries["Nicaragua"] = "NI";
-Countries["Niger"] = "NE";
-Countries["Nigeria"] = "NG";
-Countries["Niue"] = "NU";
-Countries["Norfolk Island"] = "NF";
-Countries["Northern Mariana Islands"] = "MP";
-Countries["Norway"] = "NO";
-Countries["Oman"] = "OM";
-Countries["Pakistan"] = "PK";
-Countries["Palau"] = "PW";
-Countries["Panama"] = "PA";
-Countries["Papua New Guinea"] = "PG";
-Countries["Paraguay"] = "PY";
-Countries["Peru"] = "PE";
-Countries["Philippines"] = "PH";
-Countries["Pitcairn"] = "PN";
-Countries["Poland"] = "PL";
-Countries["Portugal"] = "PT";
-Countries["Puerto Rico"] = "PR";
-Countries["Qatar"] = "QA";
-Countries["Reunion"] = "RE";
-Countries["Romania"] = "RO";
-Countries["Russian Federation"] = "RU";
-Countries["Russia"] = "RU";
-Countries["Rwanda"] = "RW";
-Countries["Saint Kitts and Nevis"] = "KN";
-Countries["Saint Lucia"] = "LC";
-Countries["Saint Vincent and The Grenadines"] = "VC";
-Countries["Samoa"] = "WS";
-Countries["San Marino"] = "SM";
-Countries["Sao Tome and Principe"] = "ST";
-Countries["Saudi Arabia"] = "SA";
-Countries["Senegal"] = "SN";
-Countries["Seychelles"] = "SC";
-Countries["Sierra Leone"] = "SL";
-Countries["Singapore"] = "SG";
-Countries["Slovenia"] = "SI";
-Countries["Solomon Islands"] = "SB";
-Countries["Somalia"] = "SO";
-Countries["South Africa"] = "ZA";
-Countries["Spain"] = "ES";
-Countries["Sri Lanka"] = "LK";
-Countries["Sudan"] = "SD";
-Countries["Suriname"] = "SR";
-Countries["Swaziland"] = "SZ";
-Countries["Sweden"] = "SE";
-Countries["Switzerland"] = "CH";
-Countries["Syrian Arab Republic"] = "SY";
-Countries["Tajikistan"] = "TJ";
-Countries["Tanzania, United Republic of"] = "TZ";
-Countries["Thailand"] = "TH";
-Countries["Togo"] = "TG";
-Countries["Tokelau"] = "TK";
-Countries["Tonga"] = "TO";
-Countries["Trinidad and Tobago"] = "TT";
-Countries["Tunisia"] = "TN";
-Countries["Turkey"] = "TR";
-Countries["Turkmenistan"] = "TM";
-Countries["Turks and Caicos Islands"] = "TC";
-Countries["Tuvalu"] = "TV";
-Countries["Uganda"] = "UG";
-Countries["Ukraine"] = "UA";
-Countries["United Arab Emirates"] = "AE";
-Countries["UK"] = "GB";
-Countries["US"] = "US";
-Countries["United States Minor Outlying Islands"] = "UM";
-Countries["Uruguay"] = "UY";
-Countries["Uzbekistan"] = "UZ";
-Countries["Vanuatu"] = "VU";
-Countries["Vatican City State (Holy See)"] = "VA";
-Countries["Venezuela"] = "VE";
-Countries["Viet Nam"] = "VN";
-Countries["Western Sahara"] = "EH";
-Countries["Yemen"] = "YE";
-Countries["Zambia"] = "ZM";
-Countries["Zimbabwe"] = "ZW";
-Countries["Taiwan"] = "TW";
-Countries["[Worldwide]"] = "XW";
-Countries["Europe"] = "XE";
-Countries["Soviet Union (historical, 1922-1991)"] = "SU";
-Countries["East Germany (historical, 1949-1990)"] = "XG";
-Countries["Czechoslovakia (historical, 1918-1992)"] = "XC";
-Countries["Congo, The Democratic Republic of the"] = "CD";
-Countries["Slovakia"] = "SK";
-Countries["Bosnia and Herzegovina"] = "BA";
-Countries["Korea (North), Democratic People's Republic of"] = "KP";
-Countries["North Korea"] = "KR"; 
-Countries["Korea (South), Republic of"] = "KR";
-Countries["South Korea"] = "KR"; 
-Countries["Montenegro"] = "ME";
-Countries["South Georgia and the South Sandwich Islands"] = "GS";
-Countries["Palestinian Territory"] = "PS";
-Countries["Macao"] = "MO";
-Countries["Timor-Leste"] = "TL";
-Countries["<85>land Islands"] = "AX";
-Countries["Guernsey"] = "GG";
-Countries["Isle of Man"] = "IM";
-Countries["Jersey"] = "JE";
-Countries["Serbia"] = "RS";
-Countries["Saint Barthélemy"] = "BL";
-Countries["Saint Martin"] = "MF";
-Countries["Moldova"] = "MD";
-Countries["Yugoslavia (historical, 1918-2003)"] = "YU";
-Countries["Serbia and Montenegro (historical, 2003-2006)"] = "CS";
-Countries["Côte d'Ivoire"] = "CI";
-Countries["Heard Island and McDonald Islands"] = "HM";
-Countries["Iran, Islamic Republic of"] = "IR";
-Countries["Saint Pierre and Miquelon"] = "PM";
-Countries["Saint Helena"] = "SH";
-Countries["Svalbard and Jan Mayen"] = "SJ";
+var Countries = {
+    Afghanistan: 'AF',
+    Albania: 'AL',
+    Algeria: 'DZ',
+    'American Samoa': 'AS',
+    Andorra: 'AD',
+    Angola: 'AO',
+    Anguilla: 'AI',
+    Antarctica: 'AQ',
+    'Antigua and Barbuda': 'AG',
+    Argentina: 'AR',
+    Armenia: 'AM',
+    Aruba: 'AW',
+    Australia: 'AU',
+    Austria: 'AT',
+    Azerbaijan: 'AZ',
+    Bahamas: 'BS',
+    Bahrain: 'BH',
+    Bangladesh: 'BD',
+    Barbados: 'BB',
+    'Barbados, The': 'BB',
+    Belarus: 'BY',
+    Belgium: 'BE',
+    Belize: 'BZ',
+    Benin: 'BJ',
+    Bermuda: 'BM',
+    Bhutan: 'BT',
+    Bolivia: 'BO',
+    Croatia: 'HR',
+    Botswana: 'BW',
+    'Bouvet Island': 'BV',
+    Brazil: 'BR',
+    'British Indian Ocean Territory': 'IO',
+    'Brunei Darussalam': 'BN',
+    Bulgaria: 'BG',
+    'Burkina Faso': 'BF',
+    Burundi: 'BI',
+    Cambodia: 'KH',
+    Cameroon: 'CM',
+    Canada: 'CA',
+    'Cape Verde': 'CV',
+    'Cayman Islands': 'KY',
+    'Central African Republic': 'CF',
+    Chad: 'TD',
+    Chile: 'CL',
+    China: 'CN',
+    'Christmas Island': 'CX',
+    'Cocos (Keeling) Islands': 'CC',
+    Colombia: 'CO',
+    Comoros: 'KM',
+    Congo: 'CG',
+    'Cook Islands': 'CK',
+    'Costa Rica': 'CR',
+    'Virgin Islands, British': 'VG',
+    Cuba: 'CU',
+    Cyprus: 'CY',
+    'Czech Republic': 'CZ',
+    Denmark: 'DK',
+    Djibouti: 'DJ',
+    Dominica: 'DM',
+    'Dominican Republic': 'DO',
+    Ecuador: 'EC',
+    Egypt: 'EG',
+    'El Salvador': 'SV',
+    'Equatorial Guinea': 'GQ',
+    Eritrea: 'ER',
+    Estonia: 'EE',
+    Ethiopia: 'ET',
+    'Falkland Islands (Malvinas)': 'FK',
+    'Faroe Islands': 'FO',
+    Fiji: 'FJ',
+    Finland: 'FI',
+    France: 'FR',
+    'French Guiana': 'GF',
+    'French Polynesia': 'PF',
+    'French Southern Territories': 'TF',
+    Gabon: 'GA',
+    Gambia: 'GM',
+    Georgia: 'GE',
+    Germany: 'DE',
+    Ghana: 'GH',
+    Gibraltar: 'GI',
+    Greece: 'GR',
+    Greenland: 'GL',
+    Grenada: 'GD',
+    Guadeloupe: 'GP',
+    Guam: 'GU',
+    Guatemala: 'GT',
+    Guinea: 'GN',
+    'Guinea-Bissau': 'GW',
+    Guyana: 'GY',
+    Haiti: 'HT',
+    'Virgin Islands, U.S.': 'VI',
+    Honduras: 'HN',
+    'Hong Kong': 'HK',
+    Hungary: 'HU',
+    Iceland: 'IS',
+    India: 'IN',
+    Indonesia: 'ID',
+    'Wallis and Futuna': 'WF',
+    Iraq: 'IQ',
+    Ireland: 'IE',
+    Israel: 'IL',
+    Italy: 'IT',
+    Jamaica: 'JM',
+    Japan: 'JP',
+    Jordan: 'JO',
+    Kazakhstan: 'KZ',
+    Kenya: 'KE',
+    Kiribati: 'KI',
+    Kuwait: 'KW',
+    Kyrgyzstan: 'KG',
+    "Lao People's Democratic Republic": 'LA',
+    Latvia: 'LV',
+    Lebanon: 'LB',
+    Lesotho: 'LS',
+    Liberia: 'LR',
+    'Libyan Arab Jamahiriya': 'LY',
+    Liechtenstein: 'LI',
+    Lithuania: 'LT',
+    Luxembourg: 'LU',
+    Montserrat: 'MS',
+    Macedonia: 'MK',
+    Madagascar: 'MG',
+    Malawi: 'MW',
+    Malaysia: 'MY',
+    Maldives: 'MV',
+    Mali: 'ML',
+    Malta: 'MT',
+    'Marshall Islands': 'MH',
+    Martinique: 'MQ',
+    Mauritania: 'MR',
+    Mauritius: 'MU',
+    Mayotte: 'YT',
+    Mexico: 'MX',
+    'Micronesia, Federated States of': 'FM',
+    Morocco: 'MA',
+    Monaco: 'MC',
+    Mongolia: 'MN',
+    Mozambique: 'MZ',
+    Myanmar: 'MM',
+    Namibia: 'NA',
+    Nauru: 'NR',
+    Nepal: 'NP',
+    Netherlands: 'NL',
+    'Netherlands Antilles': 'AN',
+    'New Caledonia': 'NC',
+    'New Zealand': 'NZ',
+    Nicaragua: 'NI',
+    Niger: 'NE',
+    Nigeria: 'NG',
+    Niue: 'NU',
+    'Norfolk Island': 'NF',
+    'Northern Mariana Islands': 'MP',
+    Norway: 'NO',
+    Oman: 'OM',
+    Pakistan: 'PK',
+    Palau: 'PW',
+    Panama: 'PA',
+    'Papua New Guinea': 'PG',
+    Paraguay: 'PY',
+    Peru: 'PE',
+    Philippines: 'PH',
+    Pitcairn: 'PN',
+    Poland: 'PL',
+    Portugal: 'PT',
+    'Puerto Rico': 'PR',
+    Qatar: 'QA',
+    Reunion: 'RE',
+    Romania: 'RO',
+    'Russian Federation': 'RU',
+    Russia: 'RU',
+    Rwanda: 'RW',
+    'Saint Kitts and Nevis': 'KN',
+    'Saint Lucia': 'LC',
+    'Saint Vincent and The Grenadines': 'VC',
+    Samoa: 'WS',
+    'San Marino': 'SM',
+    'Sao Tome and Principe': 'ST',
+    'Saudi Arabia': 'SA',
+    Senegal: 'SN',
+    Seychelles: 'SC',
+    'Sierra Leone': 'SL',
+    Singapore: 'SG',
+    Slovenia: 'SI',
+    'Solomon Islands': 'SB',
+    Somalia: 'SO',
+    'South Africa': 'ZA',
+    Spain: 'ES',
+    'Sri Lanka': 'LK',
+    Sudan: 'SD',
+    Suriname: 'SR',
+    Swaziland: 'SZ',
+    Sweden: 'SE',
+    Switzerland: 'CH',
+    'Syrian Arab Republic': 'SY',
+    Tajikistan: 'TJ',
+    'Tanzania, United Republic of': 'TZ',
+    Thailand: 'TH',
+    Togo: 'TG',
+    Tokelau: 'TK',
+    Tonga: 'TO',
+    'Trinidad & Tobago': 'TT',
+    Tunisia: 'TN',
+    Turkey: 'TR',
+    Turkmenistan: 'TM',
+    'Turks and Caicos Islands': 'TC',
+    Tuvalu: 'TV',
+    Uganda: 'UG',
+    Ukraine: 'UA',
+    'United Arab Emirates': 'AE',
+    UK: 'GB',
+    US: 'US',
+    'United States Minor Outlying Islands': 'UM',
+    Uruguay: 'UY',
+    Uzbekistan: 'UZ',
+    Vanuatu: 'VU',
+    'Vatican City State (Holy See)': 'VA',
+    Venezuela: 'VE',
+    'Viet Nam': 'VN',
+    'Western Sahara': 'EH',
+    Yemen: 'YE',
+    Zambia: 'ZM',
+    Zimbabwe: 'ZW',
+    Taiwan: 'TW',
+    '[Worldwide]': 'XW',
+    Europe: 'XE',
+    USSR: 'SU',
+    'East Germany (historical, 1949-1990)': 'XG',
+    Czechoslovakia: 'XC',
+    'Congo, Republic of the': 'CD',
+    Slovakia: 'SK',
+    'Bosnia & Herzegovina': 'BA',
+    "Korea (North), Democratic People's Republic of": 'KP',
+    'North Korea': 'KP',
+    'Korea (South), Republic of': 'KR',
+    'South Korea': 'KR',
+    Montenegro: 'ME',
+    'South Georgia and the South Sandwich Islands': 'GS',
+    'Palestinian Territory': 'PS',
+    Macao: 'MO',
+    'Timor-Leste': 'TL',
+    '<85>land Islands': 'AX',
+    Guernsey: 'GG',
+    'Isle of Man': 'IM',
+    Jersey: 'JE',
+    Serbia: 'RS',
+    'Saint Barthélemy': 'BL',
+    'Saint Martin': 'MF',
+    Moldova: 'MD',
+    Yugoslavia: 'YU',
+    'Serbia and Montenegro': 'CS',
+    "Côte d'Ivoire": 'CI',
+    'Heard Island and McDonald Islands': 'HM',
+    'Iran, Islamic Republic of': 'IR',
+    'Saint Pierre and Miquelon': 'PM',
+    'Saint Helena': 'SH',
+    'Svalbard and Jan Mayen': 'SJ'
+};
